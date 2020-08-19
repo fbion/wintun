@@ -8,6 +8,7 @@
 #define WINTUN_HWID L"Wintun"
 #define WAIT_FOR_REGISTRY_TIMEOUT 10000     /* ms */
 #define MAX_POOL_DEVICE_TYPE (MAX_POOL + 8) /* Should accommodate a pool name with " Tunnel" appended */
+#define MAX_POOL_ID 65                      /* Maximum internal pool ID string buffer size (including terminator) */
 
 const static GUID CLASS_NET_GUID = { 0x4d36e972L, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
 const static GUID ADAPTER_NET_GUID = { 0xcac88484L,
@@ -59,47 +60,6 @@ GetDeviceRegistryProperty(
         HeapFree(Heap, 0, *Buf);
         if (Result != ERROR_INSUFFICIENT_BUFFER)
             return Result;
-    }
-}
-
-/**
- * Retrieves a specified Plug and Play device property string.
- *
- * @param DevInfo       A handle to the device information set that contains a device information element that
- *                      represents the device for which to open a registry key.
- *
- * @param DevInfoData   A pointer to a structure that specifies the device information element in DevInfo.
- *
- * @param Property      The property to be retrieved. One of the SPDRP_* constants.
- *
- * @param Buf           A pointer to a string that receives the string that is being retrieved. Must be released with
- *                      HeapFree(GetProcessHeap(), 0, *Buf) after use.
- *
- * @return ERROR_SUCCESS on success; Win32 error code otherwise.
- */
-static WINTUN_STATUS
-GetDeviceRegistryString(
-    _In_ HDEVINFO DevInfo,
-    _In_ SP_DEVINFO_DATA *DevInfoData,
-    _In_ DWORD Property,
-    _Out_ WCHAR **Buf)
-{
-    DWORD Result, ValueType, Size = 256 * sizeof(WCHAR);
-    Result = GetDeviceRegistryProperty(DevInfo, DevInfoData, Property, &ValueType, Buf, &Size);
-    if (Result != ERROR_SUCCESS)
-        return Result;
-    switch (ValueType)
-    {
-    case REG_SZ:
-    case REG_EXPAND_SZ:
-    case REG_MULTI_SZ:
-        Result = RegistryGetString(Buf, Size / sizeof(WCHAR), ValueType);
-        if (Result != ERROR_SUCCESS)
-            HeapFree(GetProcessHeap(), 0, *Buf);
-        return Result;
-    default:
-        HeapFree(GetProcessHeap(), 0, *Buf);
-        return ERROR_INVALID_DATATYPE;
     }
 }
 
@@ -368,7 +328,58 @@ GetPoolDeviceTypeName(_In_z_count_c_(MAX_POOL) const WCHAR *Pool, _Out_cap_c_(MA
 }
 
 /**
- * Checks if SPDRP_DEVICEDESC or SPDRP_FRIENDLYNAME match device type name.
+ * Returns pool-specific ID.
+ */
+static WINTUN_STATUS
+GetPoolId(_In_z_count_c_(MAX_POOL) const WCHAR *Pool, _Out_cap_c_(MAX_POOL_ID) WCHAR *Id)
+{
+    BCRYPT_ALG_HANDLE AlgProvider;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&AlgProvider, BCRYPT_SHA256_ALGORITHM, NULL, 0)))
+        return ERROR_HASH_NOT_SUPPORTED;
+    BCRYPT_HASH_HANDLE Sha256 = NULL;
+    DWORD Result;
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(AlgProvider, &Sha256, NULL, 0, NULL, 0, 0)))
+    {
+        Result = ERROR_HASH_NOT_PRESENT;
+        goto cleanupBCryptCloseAlgorithmProvider;
+    }
+    static const char hash_label[] = "Wintun Pool Name Hash Stable Suffix v1 jason@zx2c4.com";
+    if (!BCRYPT_SUCCESS(BCryptHashData(Sha256, (PUCHAR)hash_label, sizeof(hash_label) - sizeof(char), 0)))
+    {
+        Result = ERROR_GEN_FAILURE;
+        goto cleanupSha256;
+    }
+    WCHAR *PoolNorm = NormalizeStringAlloc(NormalizationC, Pool);
+    if (!PoolNorm)
+    {
+        Result = ERROR_OUTOFMEMORY;
+        goto cleanupSha256;
+    }
+    if (!BCRYPT_SUCCESS(BCryptHashData(Sha256, (PUCHAR)PoolNorm, (int)wcslen(PoolNorm), 0)))
+    {
+        Result = ERROR_GEN_FAILURE;
+        goto cleanupPoolNorm;
+    }
+    BYTE Hash[32];
+    if (!BCRYPT_SUCCESS(BCryptFinishHash(Sha256, Hash, sizeof(Hash), 0)))
+    {
+        Result = ERROR_GEN_FAILURE;
+        goto cleanupPoolNorm;
+    }
+    Bin2Hex(Hash, sizeof(Hash), Id);
+    Id[64] = 0;
+    Result = ERROR_SUCCESS;
+cleanupPoolNorm:
+    HeapFree(GetProcessHeap(), 0, PoolNorm);
+cleanupSha256:
+    BCryptDestroyHash(Sha256);
+cleanupBCryptCloseAlgorithmProvider:
+    BCryptCloseAlgorithmProvider(AlgProvider, 0);
+    return Result;
+}
+
+/**
+ * Checks if device is member of the pool.
  */
 static WINTUN_STATUS
 IsPoolMember(
@@ -377,33 +388,29 @@ IsPoolMember(
     _In_ SP_DEVINFO_DATA *DevInfoData,
     _Out_ BOOL *IsMember)
 {
-    HANDLE Heap = GetProcessHeap();
-    WCHAR *DeviceDesc, *FriendlyName;
-    DWORD Result = GetDeviceRegistryString(DevInfo, DevInfoData, SPDRP_DEVICEDESC, &DeviceDesc);
-    if (Result != ERROR_SUCCESS)
-        return Result;
-    Result = GetDeviceRegistryString(DevInfo, DevInfoData, SPDRP_FRIENDLYNAME, &FriendlyName);
-    if (Result != ERROR_SUCCESS)
-        goto cleanupDeviceDesc;
-    WCHAR PoolDeviceTypeName[MAX_POOL_DEVICE_TYPE];
-    GetPoolDeviceTypeName(Pool, PoolDeviceTypeName);
-    if (!_wcsicmp_l(FriendlyName, PoolDeviceTypeName, Locale) || !_wcsicmp_l(DeviceDesc, PoolDeviceTypeName, Locale))
+    DWORD Result;
+    HKEY NetDevRegKey = SetupDiOpenDevRegKey(DevInfo, DevInfoData, DICS_FLAG_GLOBAL, 0, DIREG_DRV, KEY_QUERY_VALUE);
+    if (NetDevRegKey == INVALID_HANDLE_VALUE)
+        return GetLastError();
+    LPWSTR PoolIdReg;
+    Result = RegistryQueryString(NetDevRegKey, L"WintunPool", &PoolIdReg);
+    if (Result == ERROR_FILE_NOT_FOUND)
     {
-        *IsMember = TRUE;
-        goto cleanupFriendlyName;
+        *IsMember = FALSE;
+        Result = ERROR_SUCCESS;
+        goto cleanupNetDevRegKey;
     }
-    RemoveNumberedSuffix(FriendlyName, FriendlyName);
-    RemoveNumberedSuffix(DeviceDesc, DeviceDesc);
-    if (!_wcsicmp_l(FriendlyName, PoolDeviceTypeName, Locale) || !_wcsicmp_l(DeviceDesc, PoolDeviceTypeName, Locale))
-    {
-        *IsMember = TRUE;
-        goto cleanupFriendlyName;
-    }
-    *IsMember = FALSE;
-cleanupFriendlyName:
-    HeapFree(Heap, 0, FriendlyName);
-cleanupDeviceDesc:
-    HeapFree(Heap, 0, DeviceDesc);
+    if (Result != ERROR_SUCCESS)
+        goto cleanupNetDevRegKey;
+    WCHAR PoolId[MAX_POOL_ID];
+    Result = GetPoolId(Pool, PoolId);
+    if (Result != ERROR_SUCCESS)
+        goto cleanupPoolId2;
+    *IsMember = _wcsicmp_l(PoolId, PoolIdReg, Locale) == 0;
+cleanupPoolId2:
+    HeapFree(GetProcessHeap(), 0, PoolIdReg);
+cleanupNetDevRegKey:
+    RegCloseKey(NetDevRegKey);
     return Result;
 }
 
@@ -999,6 +1006,13 @@ WintunCreateAdapter(
         if (Result != ERROR_SUCCESS)
             goto cleanupNetDevRegKey;
     }
+    WCHAR PoolId[MAX_POOL_ID];
+    Result = GetPoolId(Pool, PoolId);
+    if (Result != ERROR_SUCCESS)
+        goto cleanupNetDevRegKey;
+    Result = RegSetValueExW(NetDevRegKey, L"WintunPool", 0, REG_SZ, (const BYTE *)PoolId, MAX_POOL_ID * sizeof(WCHAR));
+    if (Result != ERROR_SUCCESS)
+        goto cleanupNetDevRegKey;
 
     SetupDiCallClassInstaller(DIF_INSTALLINTERFACES, DevInfo, &DevInfoData); /* Ignore errors */
 

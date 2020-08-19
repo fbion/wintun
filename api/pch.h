@@ -10,6 +10,7 @@
 #include "namespace.h"
 #include "nci.h"
 #include "registry.h"
+#include "util.h"
 
 #include <bcrypt.h>
 #include <cfgmgr32.h>

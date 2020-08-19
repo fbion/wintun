@@ -191,6 +191,7 @@
     <ClInclude Include="nci.h" />
     <ClInclude Include="pch.h" />
     <ClInclude Include="registry.h" />
+    <ClInclude Include="util.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="api.c" />
@@ -202,6 +203,7 @@
     </ClCompile>
     <ClCompile Include="registry.c" />
     <ClCompile Include="rundll32.c" />
+    <ClCompile Include="util.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
